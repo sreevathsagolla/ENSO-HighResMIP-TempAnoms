@@ -61,4 +61,4 @@ Portions of the repository (code formatting/tidying up and documentation cleanup
 
 ## License
 
-No license currently specified.
+This repository is licensed under the MIT License. See the LICENSE file for details.
