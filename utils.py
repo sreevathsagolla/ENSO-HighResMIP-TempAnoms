@@ -273,7 +273,7 @@ def sequence_finder(df, t=0.5):
 
 
 def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = (-20.0, 20.0),
-                             lon_bounds_eastdeg = (120.0, 280.0), gamma: float = 0.2,)
+                             lon_bounds_eastdeg = (120.0, 280.0), gamma: float = 0.2,):
     """
     Classify ENSO events as EP, CP or Mixed using EOF-based indices.
 
@@ -569,6 +569,7 @@ def format_axis(ax, kind, **kwargs):
                                 - period      (str)  for 'oni' (e.g. 'RECENT_PAST_1976-2023', 'FUTURE_PROJ_2015-2050')
                                 - panel_id    (str)  for 'psd' (panel label)
                                 - i           (int)  for 'event_comp', 'vert_prof', 'z20'
+                                - last_row    (bool) for 'event_comp'
                                 - land_50m, coast_50m  for 'map' (cartopy features)
     """
     # Normalise kind string§
@@ -643,9 +644,7 @@ def format_axis(ax, kind, **kwargs):
         ax.set_ylabel('Latitude', fontsize=14)
         ax.set_xlabel('Longitude', fontsize=14)
         lon_ticks = np.arange(150, 310, 20)
-        # Wrap longitudes > 180 to negative values for display
         ax.set_xticks(lon_ticks)
-        ax.set_xticklabels(np.where(lon_ticks > 180, lon_ticks - 360, lon_ticks), fontsize=10,)
         lat_ticks = np.arange(-4, 6, 2)
         ax.set_yticks(lat_ticks)
         ax.set_yticklabels(lat_ticks, fontsize=10)
@@ -653,6 +652,7 @@ def format_axis(ax, kind, **kwargs):
 
     elif kind == "event_comp":
         i = kwargs.get("i")
+        last_row = kwargs.get("last_row")
         if i is None:
             raise ValueError("format_axis(kind='event_comp') requires i=...")
 
@@ -664,10 +664,10 @@ def format_axis(ax, kind, **kwargs):
         ax.axhspan(100, 150, color='gray', edgecolor='k', alpha=0.25, linewidth=2)
         ax.tick_params(axis='both', labelsize=10)
 
-        # y-labels only on left column (even indices 0,2,4)
-        ax.set_ylabel('Depth (m)' if i % 2 == 0 else '', fontsize=10)
+        # y-labels only on left column (even indices 0,2,4 etc.)
+        ax.set_ylabel('Depth (m)' if i % 2 == 0 else '', fontsize=12)
         # x-labels only on bottom row (indices 4,5)
-        ax.set_xlabel('Time (in months) relative to phase peak' if i >= 4 else '', fontsize=10,)
+        ax.set_xlabel('Time (in months) relative to phase peak' if last_row == True else '', fontsize=12,)
 
     elif kind == "vert_prof":
         i = kwargs.get("i")
