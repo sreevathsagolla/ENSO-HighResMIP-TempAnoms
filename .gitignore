@@ -7,6 +7,6 @@ data/z20_depths/*.nc
 data/zon_wnds_850hpa/*.nc
 data/thetao_con/*/*.nc
 data/anomalies/*/*.nc
-data/processed/ENSO_SSTA_COMPOSITES/*.nc
+data/processed/ENSO_TEMPANOM_COMPOSITES/*.nc
 
 # NOTE: All of these are large files to host on GitHub, but can be made available on request.
