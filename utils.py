@@ -2,7 +2,7 @@
 Code for storing utility functions for data pre-processing and plotting for analysis
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 11 December 2025
+Last updated: 22 April 2026
 """
 
 import os
@@ -12,6 +12,7 @@ import itertools
 import xarray as xr
 import pandas as pd
 import numpy as np
+from scipy import stats
 
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -358,27 +359,22 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
         # Domain crosses the dateline, so stitch two slices together
         sub = xr.concat([sub.sel(lon=slice(0, lon_hi)), sub.sel(lon=slice(lon_lo, 360))], dim='lon')
 
-    # 2. Area weighting and SVD EOF
-    w_lat = np.sqrt(np.cos(np.deg2rad(sub.lat)))
-    W = w_lat / w_lat.mean()
-    W2 = W.broadcast_like(sub)
-
-    A = (sub * W2).transpose('time', 'lat', 'lon')
-    A_loaded = A.load()  # SVD is not lazy
+    # 2. Area weighting, linear detrending and SVD EOF
+    W = np.sqrt(np.cos(np.deg2rad(sub.lat)))
+    A_loaded = (sub * W).transpose('time', 'lat', 'lon').load()  # SVD is not lazy
 
     nt, nlat, nlon = A_loaded.shape
     X = A_loaded.values.reshape(nt, nlat * nlon)
 
-    # Removing temporal mean (for robustness)
-    X = X - np.nanmean(X, axis=0, keepdims=True)
-
     # Masking all NaN columns
     good = ~np.all(np.isnan(X), axis=0)
-    Xg = X[:, good]
-    Xg = np.nan_to_num(Xg, nan=0.0)
+    Xg = np.nan_to_num(X[:, good], nan=0.0)
+
+    # Linear detrending along time axis (column-wise), also removes mean
+    Xg = detrend(Xg, axis=0, type='linear')
 
     U, S, Vt = np.linalg.svd(Xg, full_matrices=False)
-    PCs = U * S
+    PCs  = U * S
     EOFs = Vt
 
     # Reshaping first two EOFs back to (lat, lon)
@@ -414,35 +410,63 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
     eof2_n3 = float(box_mean(eof2, *N3_box).values)
     eof2_n4 = float(box_mean(eof2, *N4_box).values)
 
-    # Choosing EOF that has relatively stronger N3 loading as E like pattern
-    if (eof1_n3 - eof1_n4) >= (eof2_n3 - eof2_n4):
-        E_pattern, C_pattern = eof1.copy(), eof2.copy()
-        E_pc, C_pc = pc1.copy(), pc2.copy()
-    else:
-        E_pattern, C_pattern = eof2.copy(), eof1.copy()
-        E_pc, C_pc = pc2.copy(), pc1.copy()
+    flags = {'EOF_FLIP': False, 'E_PATTERN_SIGN_FLIP': False, 'C_PATTERN_SIGN_FLIP': False}
+    
+    # # Choosing EOF that has relatively stronger N3 loading as E like pattern
+    # if (eof1_n3 - eof1_n4) >= (eof2_n3 - eof2_n4):
+    #     E_pattern, C_pattern = eof1.copy(), eof2.copy()
+    #     E_pc, C_pc = pc1.copy(), pc2.copy()
+    # else:
+    #     E_pattern, C_pattern = eof2.copy(), eof1.copy()
+    #     E_pc, C_pc = pc2.copy(), pc1.copy()
+    #     flags['EOF_FLIP'] = True
+    
+    # COMMENT NOTE: Flipping EOFs was causing incorrect reassignment for some simulations 
+    # where EOF1 and EOF2 were not being cleanly separated in spatial variability signature 
+    # (leading to noisy/incorrect Nino3-minus-Nino4 differential). After visually checking 
+    # raw EOFs, it happened to be the case that EOF1 was always corresponding to E-like pattern.
 
+    E_pattern, C_pattern = eof1.copy(), eof2.copy()
+    E_pc, C_pc = pc1.copy(), pc2.copy()
+    
     # Fixing signs so that positive E warms Niño 3 and positive C warms Niño 4
     if float(box_mean(E_pattern, *N3_box).values) < 0:
         E_pattern = -E_pattern
         E_pc = -E_pc
+        flags['E_PATTERN_SIGN_FLIP'] = True
     if float(box_mean(C_pattern, *N4_box).values) < 0:
         C_pattern = -C_pattern
         C_pc = -C_pc
+        flags['C_PATTERN_SIGN_FLIP'] = True
+        
+    # Standardise PCs BEFORE rotation (ensures equal variance)
+    E_pc_std = (E_pc - E_pc.mean()) / E_pc.std()
+    C_pc_std = (C_pc - C_pc.mean()) / C_pc.std()
 
-    # Standardising indices (z scores)
-    E = ((E_pc - E_pc.mean()) / E_pc.std()).rename('E_index')
-    C = ((C_pc - C_pc.mean()) / C_pc.std()).rename('C_index')
+    # 45-degree rotation (Takahashi et al. 2011)
+    E = ((E_pc_std - C_pc_std) / np.sqrt(2)).rename('E_index')
+    C = ((E_pc_std + C_pc_std) / np.sqrt(2)).rename('C_index')
 
-    # 4. Niño indices for peaking and reporting
-    nino3 = box_mean(ssta, *N3_box).rename('nino3')
-    nino4 = box_mean(ssta, *N4_box).rename('nino4')
+    # Rotate spatial patterns
+    E_pat_orig = E_pattern.copy()
+    C_pat_orig = C_pattern.copy()
+    E_pattern = (E_pat_orig - C_pat_orig) / np.sqrt(2)
+    C_pattern = (E_pat_orig + C_pat_orig) / np.sqrt(2)
+
+    # Niño indices
+    nino3  = box_mean(ssta, *N3_box).rename('nino3')
+    nino4  = box_mean(ssta, *N4_box).rename('nino4')
     nino34 = box_mean(ssta, *N34_box).rename('nino34')
 
-    indices = xr.Dataset({'E_index': E, 'C_index': C, 'PC1': pc1, 'PC2': pc2, 
-                          'nino3': nino3, 'nino4': nino4, 'nino34': nino34,})
+    indices = xr.Dataset({'E_index': E, 'C_index': C, 'PC1': pc1, 
+                          'PC2': pc2, 'nino3': nino3, 
+                          'nino4': nino4, 'nino34': nino34,})
 
-    eof_patterns = xr.Dataset({'EOF_E': E_pattern.rename('EOF_E'), 'EOF_C': C_pattern.rename('EOF_C'),})
+    # EOF Patterns: Both 'raw' and rotated E/C spatial patterns
+    eof_patterns = xr.Dataset({'EOF1_raw': eof1.rename('EOF1_raw'),
+                               'EOF2_raw': eof2.rename('EOF2_raw'),
+                               'EOF_E': E_pattern.rename('EOF_E'),
+                               'EOF_C': C_pattern.rename('EOF_C'),})
 
     # 5. Helper to classify one list of events given a peak selector
     def classify_events(event_windows: List[List[pd.Timestamp]], peak_selector: str) -> Tuple[Dict[str, int], List[Dict]]:
@@ -488,7 +512,124 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
     counts_ln, events_ln = classify_events(ln_list, peak_selector='cold')
 
     return {'counts_elnino': counts_el, 'counts_lanina': counts_ln, 'events_elnino': events_el,
-            'events_lanina': events_ln, 'indices': indices, 'eof_patterns': eof_patterns,}
+            'events_lanina': events_ln, 'indices': indices, 'eof_patterns': eof_patterns, 'flags': flags}
+
+
+def calculate_cdam(ds, threshold, method="sign"):
+    """
+    Calculate Cross-Dataset Agreement Mask (CDAM) and group mean composites
+    for both El Niño and La Niña phases.
+
+    For each phase (EN, LN), this function computes:
+
+    1. A group mean composite ({phase}_COMPOSITE_GRPM) by averaging the
+       per-dataset composites across the 'dataset' dimension.
+    2. A Cross-Dataset Agreement Mask ({phase}_COMPOSITE_CDAM) encoding where
+       datasets agree, using one of two methods:
+
+       - 'sign': CDAM = 1 where >= threshold datasets agree on the sign
+         of the composite (all positive or all negative), else 0.
+       - 'significance': A priority-coded mask:
+             CDAM =  2  where >= threshold datasets agree the value IS significant (p < 0.05).
+             CDAM =  1  where >= threshold datasets agree the value IS NOT significant,
+                        but not unanimously (i.e., at least one dataset disagrees).
+             CDAM = -1  where ALL datasets agree the value is not significant.
+             CDAM =  0  where no agreement condition is met.
+             Priority: significance (2) > partial insignificance (1) > full insignificance (-1).
+
+    Both results are added in-place to ds, and a human-readable
+    provenance string is appended to ds.attrs['history'].
+
+    Parameters
+    ----------
+    ds (xr.Dataset)  : Dataset with dimensions (dataset, lat, lon). Must contain
+                        EN_COMPOSITE, LN_COMPOSITE, EN_COMPOSITE_SIG, LN_COMPOSITE_SIG.
+    threshold (int)  : Number of datasets required for agreement.
+                        Must satisfy 1 <= threshold <= n_datasets.
+    method (str)     : Agreement criterion — 'sign' or 'significance' (see above).
+
+    Returns
+    -------
+    ds (xr.Dataset)  : The input dataset with the following variables added for
+                        each phase in {EN, LN}:
+                        - {phase}_COMPOSITE_GRPM : Group mean composite across datasets.
+                        - {phase}_COMPOSITE_CDAM : Cross-Dataset Agreement Mask (integer coded).
+    """
+    # --- Input validation ---
+    if not isinstance(threshold, (int, np.integer)):
+        raise TypeError(f"'threshold' must be an integer, got {type(threshold).__name__}")
+
+    n = ds.sizes["dataset"]
+    if threshold < 1 or threshold > n:
+        raise ValueError(f"'threshold' must be between 1 and {n}, got {threshold}")
+
+    # Checking that all required composite and significance variables are present
+    required = [f"{p}_{v}" for p in ("EN", "LN") for v in ("COMPOSITE", "COMPOSITE_SIG")]
+    missing = [v for v in required if v not in ds]
+    if missing:
+        raise KeyError(f"Missing required variables: {missing}")
+
+    history_parts = []
+
+    for phase in ("EN", "LN"):
+        comp_var, sig_var = f"{phase}_COMPOSITE", f"{phase}_COMPOSITE_SIG"
+
+        # Computing group mean composite across all datasets
+        ds[f"{phase}_COMPOSITE_GRPM"] = ds[comp_var].mean(dim="dataset")
+
+        # Building the Cross-Dataset Agreement Mask
+        if method == "sign":
+            # Counting datasets with positive/negative composite values per gridcell
+            n_pos = (ds[comp_var] > 0).sum(dim="dataset")
+            n_neg = (ds[comp_var] < 0).sum(dim="dataset")
+            # Agreement if either polarity reaches the threshold
+            cdam = xr.where((n_pos >= threshold) | (n_neg >= threshold), 1, 0)
+
+            method_desc = (
+                f"Sign agreement: CDAM=1 where >= {threshold}/{n} datasets agree on sign, else 0."
+            )
+
+        elif method == "significance":
+            # Converting significance mask to boolean and counting agreements
+            sig = ds[sig_var].astype(bool)
+            n_sig = sig.sum(dim="dataset")
+            n_insig = (~sig).sum(dim="dataset")
+
+            # Initialising CDAM as zeros, then applying conditions in priority order
+            # (lowest priority first, highest last so it overwrites)
+            cdam = xr.full_like(ds[f"{phase}_COMPOSITE_GRPM"], 0, dtype=int)
+            # All datasets agree value is not significant
+            cdam = xr.where(n_insig == n, -1, cdam)
+            # Threshold datasets agree value is not significant, but not all
+            cdam = xr.where((n_insig >= threshold) & (n_insig < n), 1, cdam)
+            # Threshold datasets agree value IS significant (highest priority)
+            cdam = xr.where(n_sig >= threshold, 2, cdam)
+
+            method_desc = (
+                f"Significance agreement: CDAM=2 (>= {threshold}/{n} significant), "
+                f"1 (>= {threshold}/{n} insignificant, not all), -1 (all insignificant), 0 (no agreement)."
+            )
+
+        else:
+            raise ValueError(f"method must be 'sign' or 'significance', got '{method}'")
+
+        ds[f"{phase}_COMPOSITE_CDAM"] = cdam
+
+        # Recording provenance for this phase
+        history_parts.append(
+            f"{comp_var}: Composite mean across all {phase} events per dataset "
+            f"(each event = temporal mean over event months). "
+            f"{sig_var}: Per-gridcell significance (one-sample t-test vs zero, p<0.05). "
+            f"{phase}_COMPOSITE_GRPM: Group mean of {comp_var} across {n} datasets. "
+            f"{phase}_COMPOSITE_CDAM: {method_desc}"
+        )
+
+    # Appending provenance to dataset history attribute
+    history = " | ".join(history_parts) + f" [threshold={threshold}, n_datasets={n}, method='{method}']"
+    existing = ds.attrs.get("history", "")
+    ds.attrs["history"] = f"{existing}\n{history}" if existing else history
+
+    return ds
 
 def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
                           lat_bounds=(-5, 5), lon_bounds=(140, 270),):
@@ -590,11 +731,7 @@ def format_axis(ax, kind, **kwargs):
         ax.set_ylabel('ONI (°C)', fontsize=16)
         
         # Use different tick ranges for recent past vs future projections
-        if period == 'RECENT_PAST_1976-2023':
-            ticks = pd.date_range('1976-01-01', '2023-12-31', freq='5YE')
-        else:
-            ticks = pd.date_range('2015-01-01', '2050-12-31', freq='5YE')
-
+        ticks = pd.date_range(f'{period.split('_')[-1][0:4]}-01-01', f'{period.split('_')[-1][-4:]}-12-31', freq = '5YE')
         tick_labels = [x.year for x in ticks]
         ax.set_xticks(ticks)
         ax.set_xticklabels(tick_labels)
@@ -648,7 +785,7 @@ def format_axis(ax, kind, **kwargs):
         lat_ticks = np.arange(-4, 6, 2)
         ax.set_yticks(lat_ticks)
         ax.set_yticklabels(lat_ticks, fontsize=10)
-        ax.grid(visible=True, linestyle='--', linewidth=0.5, alpha=0.5)
+        ax.grid(visible = True, linestyle = '--', linewidth = 1, alpha = 0.65)
 
     elif kind == "event_comp":
         i = kwargs.get("i")
@@ -710,7 +847,7 @@ def format_axis(ax, kind, **kwargs):
             ax.invert_yaxis()
         else:
             ax.set_ylabel('Depth bias (m)', fontsize=14)
-            ax.set_ylim([-17, 17])
+            ax.set_ylim([-24, 24])
 
     else:
         raise ValueError(f"Unknown format kind: {kind!r}")
@@ -897,49 +1034,49 @@ def jitter(x, y, k, r=0.35):
     ang = (k % 12) * (np.pi/6.0)
     return x + r*np.cos(ang), y + r*np.sin(ang)
 
-def event_hov_calculator(dataset=None, event=None, enso_event_dict = None, n34_hov = None):
+def event_hov_calculator(dataset=None, event_type=None, enso_event_flav_dict = None, n34_hov = None):
     """
     Calculate El Niño or La Niña composite Hovmöller (depth vs. time; averaged over Niño 3.4)
-    for a given dataset by centring each event on its maximum and averaging across events.
+    for a given dataset by slicing -12 to + 8 months time slice about an ENSO events' peak timestamp.
     
     Parameters
     ----------
     dataset (str)             : Dataset name as a string.
     event (str)               : ENSO event type (i.e., EL-NINO or LA-NINA).
-    enso_event_dict (dict)    : Nested dictionary of event windows keyed by dataset.
-                                name and by phase, for example:
-                                {
-                                  'HadGEM3-GC31-HH_CTRL': {
-                                      'EL-NINO': [[ts1, ts2, ...], ...],
-                                      'LA-NINA': [[ts1, ts2, ...], ...]
-                                  },
-                                  ...
-                                }
+    enso_event_flav_dict (dict)    : Nested dictionary of ENSO event flavours, containing event peak timestamps
     n34_hov (xr.DataArray)    : Niño 3.4 Hovmoller (depth vs. time) for the full-time period.
 
     """
-    # Retrieving all event windows for dataset + event
-    events = enso_event_dict[dataset][event]
+    event_peak_times = [_['peak_time'] for _ in enso_event_flav_dict[dataset][f'events_{event_type}']]
+    
     base = n34_hov.sel(dataset=dataset)
-
+    rel_time = np.arange(-14,9)
+    
     hov_list = []
-
-    for idx, ts in enumerate(events):
-        # Extracting event segment
-        hov = base.sel(time=ts)
-        # Identifying index of maximum |SST anomaly| at surface
-        surf = hov.sel(depth=0, method="nearest")
-        max_idx = int(abs(surf).argmax(dim="time"))
-        # Centreing time axis so peak occurs at t=0
-        hov["time"] = np.arange(hov.sizes["time"]) - max_idx
-        # Adding an event-id dimension for later averaging
+    for idx, peak_ts in enumerate(event_peak_times):
+        # Build absolute monthly timestamps
+        target_time = peak_ts + pd.DateOffset(months=0)  # ensure Timestamp        
+        target_time = pd.date_range(start=peak_ts + pd.DateOffset(months=-14),periods=23, freq='MS')
+        # Reindex instead of slicing
+        hov = base.reindex(time=target_time)
+        # Replace absolute time with relative time
+        hov = hov.assign_coords(time=rel_time)
         hov = hov.expand_dims(event_id=[idx])
         hov_list.append(hov)
-        
     # Stacking events and averaging
-    hov_all = xr.concat(hov_list, dim="event_id")
-    hov_mean = hov_all.mean(dim="event_id").expand_dims(dataset=[dataset])
-    return hov_mean
+    hov_all = xr.concat(hov_list, dim="event_id").expand_dims(dataset = [dataset])
+    t_stat, p_val = stats.ttest_1samp(hov_all, popmean = 0, axis = 1)
+    sig_mask = p_val < 0.05
+    
+    if event_type == 'elnino':
+        hov_all = hov_all.assign_coords(event_type = ('event_id', ['EL-NINO']*hov_all['event_id'].shape[0]))
+        hov_all = hov_all.mean(dim = 'event_id').rename('EN_COMPOSITE').to_dataset()
+        hov_all['EN_COMPOSITE_SIG'] = (('dataset', 'time', 'depth'), sig_mask)
+    elif event_type == 'lanina':
+        hov_all = hov_all.assign_coords(event_type = ('event_id', ['LA-NINA']*hov_all['event_id'].shape[0]))
+        hov_all = hov_all.mean(dim = 'event_id').rename('LN_COMPOSITE').to_dataset()
+        hov_all['LN_COMPOSITE_SIG'] = (('dataset', 'time', 'depth'), sig_mask)
+    return hov_all
 
 def gridcell_counter(da):
     """

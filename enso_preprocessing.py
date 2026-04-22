@@ -4,7 +4,7 @@ from CMIP6 HighResMIP model simulations, NPD_eORCA025 atmosphere-forced ocean-on
 model runs, and observations-based datasets
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 11 December 2025
+Last updated: 22 April 2026
 """
 
 # =============================================================================
@@ -173,49 +173,37 @@ def calculate_oni_statistics(n34_series, oni_series, el_ts, ln_ts):
 # =============================================================================
 
 def build_event_timestamps(enso_event_flavour):
-    """Build event timestamps organised by flavour type."""
-    event_ts = {'CP': {'EL-NINO': [], 'LA-NINA': []},
-                'EP': {'EL-NINO': [], 'LA-NINA': []},
-                'Mixed': {'EL-NINO': [], 'LA-NINA': []}}
-    
+    """
+    Build a flat list of ENSO events, with each list item formatted as:
+    (phase_type, flavour_type, event_timestamps)
+    """
+    event_ts = []
     # Process El Niño events
     for event in enso_event_flavour['events_elnino']:
-        reg_type = event['label']
-        if reg_type in event_ts:
-            event_ts[reg_type]['EL-NINO'] += list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))
-    
+        event_ts.append(('EL-NINO', event['label'], list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))))
+
     # Process La Niña events
     for event in enso_event_flavour['events_lanina']:
-        reg_type = event['label']
-        if reg_type in event_ts:
-            event_ts[reg_type]['LA-NINA'] += list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))
-    
+        event_ts.append(('LA-NINA', event['label'], list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))))
     return event_ts
 
 
 def compute_enso_composites(ds_pac, event_ts, enso_events, dataset):
-    """Compute ENSO SSTA composites for different flavours."""
+    """Compute event-level ENSO SSTA composites, and merges into a single dataset."""
     composite_ds = []
     
-    # Flavour-based composites
-    for reg_type in ['CP', 'EP', 'Mixed']:
-        # El Niño composite
-        composite_ds.append(ds_pac.sel(time=event_ts[reg_type]['EL-NINO']).mean(dim=["time"])
-                            .rename({"anomaly": "EN_COMPOSITE"}).expand_dims(dataset=[dataset], event_reg_type=[reg_type]))
+    for event_id, (event_type, reg_type, event_timesteps) in enumerate(event_ts):
+        da = (ds_pac.sel(time=event_timesteps)
+                    .mean(dim="time")                              # keeps (depth, lat, lon) or (lat, lon) depending on ds_pac
+                    .rename({"anomaly": "event_level_composite"})
+                    .expand_dims(event_id=[event_id], dataset=[dataset]))
         
-        # La Niña composite
-        composite_ds.append(ds_pac.sel(time=event_ts[reg_type]['LA-NINA']).mean(dim=["time"])
-                            .rename({"anomaly": "LN_COMPOSITE"}).expand_dims(dataset=[dataset], event_reg_type=[reg_type]))
-    
-    # Full (all flavours) composites
-    composite_ds.extend([ds_pac.sel(time=flatten(enso_events["EL-NINO"])).mean(dim=["time"])
-                         .rename({"anomaly": "EN_COMPOSITE"}).expand_dims(dataset=[dataset], event_reg_type=['Total']),
-                         
-                         ds_pac.sel(time=flatten(enso_events["LA-NINA"])).mean(dim=["time"])
-                         .rename({"anomaly": "LN_COMPOSITE"}).expand_dims(dataset=[dataset], event_reg_type=['Total'])])
-    
+        da = da.assign_coords(
+            event_reg_type=("event_id", [reg_type]),
+            event_type=("event_id", [event_type]),
+        )
+        composite_ds.append(da)
     return xr.merge(composite_ds).compute()
-
 
 # =============================================================================
 # MAIN PROCESSING FUNCTION
@@ -265,7 +253,7 @@ def process_single_dataset(dataset, year_start, year_end, time_index,
     
     # Compute and save composites
     composite_ds = compute_enso_composites(ds_pac, event_ts, enso_events[dataset], dataset)
-    composite_ds.to_netcdf(f'./data/processed/ENSO_SSTA_COMPOSITES/ENSO_SSTA_COMPOSITES_{dataset}_{period_label}.nc')
+    composite_ds.to_netcdf(f'./data/processed/ENSO_TEMPANOM_COMPOSITES/ENSO_TEMPANOM_COMPOSITES_{dataset}_{period_label}.nc')
 
 
 # =============================================================================
