@@ -4,7 +4,7 @@ from CMIP6 HighResMIP model simulations, NPD_eORCA025 atmosphere-forced ocean-on
 model runs, and observations-based datasets
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 22 April 2026
+Last updated: 16 June 2026
 """
 
 # =============================================================================
@@ -53,15 +53,19 @@ KEY_MAP = {"counts_elnino": ["EP-EN", "CP-EN", "MIXED-EN", "TOTAL-EN"],
 # Dataset name lists
 HIGHRESMIP_MODELS = ["HadGEM3-GC31-HH", "EC-Earth3P-HR", "CNRM-CM6-1-HR",
                      "CMCC-CM2-VHR4", "MPI-ESM1-2-HR", "MPI-ESM1-2-XR"]
-HIGHRESMIP_FORCING_GROUPS = ["CTRL", "HIST-FUT"]
-HIGHRESMIP_EXPS = [f"{model}_{group}" for model, group in product(HIGHRESMIP_MODELS, HIGHRESMIP_FORCING_GROUPS)]
+# HighResMIP forcing groups evaluated in each period: CTRL (control-1950) and HIST (hist-1950)
+# over the historical period; SCEN (highres-future) over the future period
+HIST_EVAL_GROUPS = ["CTRL", "HIST"]
+FUTR_EVAL_GROUPS = ["SCEN"]
+HIGHRESMIP_HIST_EVAL_EXPS = [f"{model}_{group}" for model, group in product(HIGHRESMIP_MODELS, HIST_EVAL_GROUPS)]
+HIGHRESMIP_FUTR_EVAL_EXPS = [f"{model}_{group}" for model, group in product(HIGHRESMIP_MODELS, FUTR_EVAL_GROUPS)]
 
 NPD_EXPS = ["NPD_eORCA025_ERA5", "NPD_eORCA025_JRA55"]
 OBS = ["EN4", "ORAS5"]
 
-# Dataset lists for different time periods
-DATASET_LIST_RECENT_PAST = HIGHRESMIP_EXPS + NPD_EXPS + OBS  # 1976-2023
-DATASET_LIST_FUTURE_PROJ = HIGHRESMIP_EXPS.copy()  # 2015-2050
+# Dataset lists for each evaluation period
+DATASET_LIST_HIST_EVAL = HIGHRESMIP_HIST_EVAL_EXPS + NPD_EXPS + OBS  # 1979-2014
+DATASET_LIST_FUTR_EVAL = HIGHRESMIP_FUTR_EVAL_EXPS  # 2015-2050
 
 # ENSO flavour columns
 ENSO_FLAVOUR_COLS = ["EP-EN", "CP-EN", "MIXED-EN", "TOTAL-EN", "EP-LN", "CP-LN", "MIXED-LN", "TOTAL-LN"]
@@ -344,13 +348,13 @@ def run_period(dataset_list, start_date, end_date, period_label):
 if __name__ == "__main__":
     # Setup Dask cluster
     cluster, client = setup_dask_cluster()
-    print(client)
+    print('Dashboard URL:', client.dashboard_link)
     
-    # Process recent past period (1976-2023)
-    run_period(dataset_list=DATASET_LIST_RECENT_PAST, start_date="1976-01-01", end_date="2023-12-31", period_label="RECENT_PAST_1976-2023")
+    # Process historical evaluation period (1979-2014): CTRL, HIST, NPD and OBS
+    run_period(dataset_list=DATASET_LIST_HIST_EVAL, start_date="1979-01-01", end_date="2014-12-31", period_label="HIST_EVAL_1979-2014")
     
-    # Process future projections period (2015-2050)
-    run_period(dataset_list=DATASET_LIST_FUTURE_PROJ, start_date="2015-01-01", end_date="2050-12-31", period_label="FUTURE_PROJ_2015-2050")
+    # Process future evaluation period (2015-2050): SCEN only
+    run_period(dataset_list=DATASET_LIST_FUTR_EVAL, start_date="2015-01-01", end_date="2050-12-31", period_label="FUTR_EVAL_2015-2050")
     
     # Cleanup
     client.shutdown()

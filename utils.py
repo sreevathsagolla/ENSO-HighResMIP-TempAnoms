@@ -2,7 +2,7 @@
 Code for storing utility functions for data pre-processing and plotting for analysis
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 22 April 2026
+Last updated: 16 June 2026
 """
 
 import os
@@ -44,7 +44,8 @@ def setup_dask_cluster(n_workers=6, threads_per_worker=3, memory_limit="48GB"):
                      "local_directory": "/dssgfs01/scratch/sg13n23/temp/"})
     cluster = LocalCluster(n_workers=n_workers, 
                            threads_per_worker=threads_per_worker, 
-                           memory_limit=memory_limit)
+                           memory_limit=memory_limit,
+                           dashboard_address=":8787",)
     client = Client(cluster)
     return cluster, client
 
@@ -162,18 +163,21 @@ def z20_calculator(ds):
 # HELPER FUNCTIONS USED IN enso_preprocessing.py SCRIPT
 # =============================================================================
 
-def compute_psd(series, nperseg, period_min, period_max, fs):
+def compute_psd(series, nperseg, period_min, period_max, fs,
+                noverlap_frac=0.75, nfft=512):
     """
     Compute Welch power spectral density of a 1D time series.
 
-    The series is first linearly detrended, then the PSD is estimated
-    with scipy.signal.welch using a Hann window. The function returns
-    periods rather than frequencies, and also identifies the dominant
-    peak within a user supplied period band.
+    The PSD is estimated with scipy.signal.welch using a Hann window.
+    Each segment is linearly detrended internally by welch before
+    windowing, which removes local trends that a single global detrend
+    would miss. The function returns periods rather than frequencies,
+    and also identifies the dominant peak within a user supplied period
+    band.
 
     Parameters
     ----------
-    series (pd.Series) : Input time series (e.g. Niño 3.4 index) with 
+    series (pd.Series) : Input time series (e.g. Niño 3.4 index) with
                          a datetime index.
     nperseg (int)      : Maximum segment length passed to 'welch'. The actual segment
                          length is 'min(nperseg, len(series))'.
@@ -183,11 +187,17 @@ def compute_psd(series, nperseg, period_min, period_max, fs):
                          peak detection. Outside this band PSD values are discarded.
     fs (float)         : Sampling frequency in samples per year. For monthly data this
                          is typically 12.0.
+    noverlap_frac (float) : Fractional overlap between segments. 0.75 (75%) is
+                            recommended for the Hann window to maximise data
+                            utilisation from short records. Default is 0.75.
+    nfft (int)         : FFT length. Values larger than nperseg zero-pad each segment,
+                         producing a denser frequency grid without changing true
+                         spectral resolution. Default is 512.
 
     Returns
     -------
     period (np.ndarray): 1D array of periods (years) retained for plotting. None if the
-                        input length is too short or no values fall inside the band.
+                         input length is too short or no values fall inside the band.
     Pxx (np.ndarray)   : Welch PSD estimate corresponding to period. Same shape as
                          "period" or None.
     peak_period (float): Period at which the PSD attains its maximum value inside the
@@ -195,17 +205,18 @@ def compute_psd(series, nperseg, period_min, period_max, fs):
     peak_psd (float)   : PSD value at "peak_period". None if not defined.
     """
     x = series.astype(float).dropna().values
-    if len(x) < max(32, nperseg):
+    seg = min(nperseg, len(x))
+    if len(x) < max(32, seg):
         # Not enough data to compute a stable PSD
         return None, None, None, None
 
-    # Detrending in time before spectral estimation
-    x_dt = detrend(x, type="linear")
-
-    f, Pxx = welch(x_dt, fs=fs, window="hann",
-                   nperseg=min(nperseg, len(x_dt)),
-                   noverlap=int(min(nperseg, len(x_dt)) * 0.5),
-                   detrend=False, scaling="density",)
+    # PSD via Welch's method with per-segment linear detrending
+    f, Pxx = welch(x, fs=fs, window="hann",
+                   nperseg=seg,
+                   noverlap=int(seg * noverlap_frac),
+                   nfft=nfft,
+                   detrend="linear",
+                   scaling="density")
 
     # Converting frequencies to periods in years, guard against divide by zero
     period = 1.0 / np.maximum(f, 1e-12)
@@ -691,7 +702,7 @@ def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
 # HELPER FUNCTIONS USED IN plotting.ipynb NOTEBOOK
 # =============================================================================
 
-def format_axis(ax, kind, **kwargs):
+def format_axis(ax = None, kind = None, **kwargs):
     """
     Generic axis formatting helper for plotting.ipynb notebook
 
@@ -707,13 +718,13 @@ def format_axis(ax, kind, **kwargs):
                                 - 'vert_prof'   : Vertical profile panels (latitudinal extent / anomaly)
                                 - 'z20'         : Z20 depth panels (climatology and bias)
     kwargs                    : Extra options needed for some kinds:
-                                - period      (str)  for 'oni' (e.g. 'RECENT_PAST_1976-2023', 'FUTURE_PROJ_2015-2050')
+                                - period      (str)  for 'oni' (e.g. 'HIST_EVAL_1979-2014', 'FUTR_EVAL_2015-2050')
                                 - panel_id    (str)  for 'psd' (panel label)
                                 - i           (int)  for 'event_comp', 'vert_prof', 'z20'
                                 - last_row    (bool) for 'event_comp'
                                 - land_50m, coast_50m  for 'map' (cartopy features)
     """
-    # Normalise kind string§
+    # Normalise kind string
     kind = str(kind).lower()
 
     if kind == "oni":
@@ -721,21 +732,31 @@ def format_axis(ax, kind, **kwargs):
         if period is None:
             raise ValueError("format_axis(kind='oni') requires period=...")
 
-        ax.set_ylim(-2.5, 3.15)
-        ax.grid(which='major', color='#DDDDDD', linewidth=0.8)
-        ax.grid(which='minor', color='#EEEEEE', linestyle=':', linewidth=0.5)
-        ax.minorticks_on()
-        ax.axhline(0, ls='-', color='grey', linewidth=2.5)
+        twin = kwargs.get("twin", False)             # True for an overlaid .twiny() axis
+        offset = kwargs.get("model_year_offset")     # e.g. 30 -> label ticks as CTRL model years
 
-        ax.set_xlabel('Year', fontsize=16)
-        ax.set_ylabel('ONI (°C)', fontsize=16)
-        
-        # Use different tick ranges for recent past vs future projections
-        ticks = pd.date_range(f'{period.split('_')[-1][0:4]}-01-01', f'{period.split('_')[-1][-4:]}-12-31', freq = '5YE')
-        tick_labels = [x.year for x in ticks]
+        # 5-yearly x ticks across the period; calendar years, or model years if offset is given
+        y0, y1 = int(period.split('_')[-1][:4]), int(period.split('_')[-1][-4:])
+        ticks = pd.date_range(f'{y0}-01-01', f'{y1}-12-31', freq='5YE')
         ax.set_xticks(ticks)
-        ax.set_xticklabels(tick_labels)
+        if offset is None:
+            ax.set_xticklabels([t.year for t in ticks])
+        else:
+            ax.set_xticklabels([str(t.year - y0 + offset) for t in ticks])
         ax.tick_params(axis='both', which='major', labelsize=12)
+
+        if twin:
+            # Overlaid axis: only its own x ticks; leave the y-axis decorations to the primary
+            ax.minorticks_off()
+            ax.grid(False)
+        else:
+            ax.set_ylim(kwargs.get("ylim", (-3.5, 3.5)))
+            ax.grid(which='major', color='#DDDDDD', linewidth=0.8)
+            ax.grid(which='minor', color='#EEEEEE', linestyle=':', linewidth=0.5)
+            ax.minorticks_on()
+            ax.axhline(0, ls='-', color='grey', linewidth=2.5)
+            ax.set_xlabel('Year', fontsize=16)
+            ax.set_ylabel('ONI (°C)', fontsize=16)
 
     elif kind == "psd":
         panel_id = kwargs.get("panel_id", "")
@@ -793,7 +814,8 @@ def format_axis(ax, kind, **kwargs):
         if i is None:
             raise ValueError("format_axis(kind='event_comp') requires i=...")
 
-        ax.set_xlim([-14, 8])
+        ax.set_xlim([-12,8])
+        ax.set_ylim([250,0])
         ax.set_xticks(np.arange(-14, 8.1, 2))
         ax.set_yticks(np.arange(0, 300.1, 50))
         ax.grid(True, ls='--', alpha=0.2, color='k')
@@ -818,11 +840,8 @@ def format_axis(ax, kind, **kwargs):
         ax.invert_yaxis()
 
         if i < 2:
-            # Left two panels: plot latitudinal extent in percent
-            ax.set_xticks(np.arange(0, 101, 25))
-            vals = ax.get_xticks()
-            ax.set_xticklabels(['{:.0f}%'.format(x) for x in vals])
-            ax.set_xlabel('Latitudinal extent', fontsize=18)
+            # Left two panels: latitudinal extent (auto-scaled x-axis, no % formatting)
+            ax.set_xlabel('Latitudinal extent within 10°S-10°N', fontsize=18)
         else:
             # Right panel: anomaly profile with a simpler locator
             ax.xaxis.set_major_locator(plt.MaxNLocator(5))
@@ -836,17 +855,17 @@ def format_axis(ax, kind, **kwargs):
         ax.set_xticks(np.arange(140, 280.1, 20))
         ax.set_xlim([135, 285])
         ax.grid(visible=True, ls='--', lw=1, alpha=0.5, color='gray')
-        ax.set_xlabel('Longitude', fontsize=14)
-        ax.tick_params(axis='both', labelsize=12)
+        ax.set_xlabel('Longitude', fontsize=16)
+        ax.tick_params(axis='both', labelsize=14)
         # Highlight Niño 3.4 longitude band
         ax.axvspan(-170 + 360, -120 + 360, color='gray', alpha=0.2, lw=2, ec='black')
 
         if i < 1:
-            ax.set_ylabel('Depth (m)', fontsize=14)
+            ax.set_ylabel('Depth (m)', fontsize=16)
             ax.set_ylim([0, 200])
             ax.invert_yaxis()
         else:
-            ax.set_ylabel('Depth bias (m)', fontsize=14)
+            ax.set_ylabel('Depth bias (m)', fontsize=16)
             ax.set_ylim([-24, 24])
 
     else:
@@ -907,7 +926,7 @@ def add_colorbar(fig, axes, mappable, label, ticks, side="right",
     return cb
 
 
-def plot_with_spread(ax, da, color, label, coord_dim, horizontal=True):
+def plot_with_spread(ax, da, color, label, coord_dim, horizontal=True, linestyle = '-'):
     """
     Plot group-mean profile with ±1 std shaded.
 
@@ -934,12 +953,12 @@ def plot_with_spread(ax, da, color, label, coord_dim, horizontal=True):
 
     if horizontal:
         # Standard x = coord_dim, y = value
-        ax.plot(coord, mean_vals.values, color=color, ls="-", label=label)
+        ax.plot(coord, mean_vals.values, color=color, ls=linestyle, label=label)
         ax.fill_between(coord, mean_vals.values - std_vals.values, 
                         mean_vals.values + std_vals.values, color=color, alpha=0.2, )
     else:
         # Flipped: y = coord_dim, x = value (e.g. depth profiles)
-        ax.plot(mean_vals.values, coord, color=color, ls="-", label=label)
+        ax.plot(mean_vals.values, coord, color=color, ls=linestyle, label=label)
         ax.fill_betweenx(coord, mean_vals.values - std_vals.values,
                          mean_vals.values + std_vals.values, color=color, alpha=0.2,)
 
@@ -1088,10 +1107,10 @@ def gridcell_counter(da):
     number_of_gridcells = (~np.isnan(da)).sum(dim='lat')
     # Mask locations with zero valid cells
     number_of_gridcells = number_of_gridcells.where(number_of_gridcells != 0)
-    # Convert to percentage and average across longitude and return
-    return 100 * (number_of_gridcells / da.sizes['lat']).mean(dim = ['lon'])
+    # Convert to number of latitudinal degrees and average across longitude and return
+    return 20*(number_of_gridcells / da.sizes['lat']).mean(dim = ['lon'])
     
-def z20_grp_calc(da_z20, enso_timestamps, axes, color, label):
+def z20_grp_calc(da_z20, enso_timestamps, axes, color, label, linestyle='-'):
     """
     Calculate and plot the mean depth of 20˚C (Z20) isotherm for ENSO events and the
     climatological baseline mean
@@ -1126,11 +1145,11 @@ def z20_grp_calc(da_z20, enso_timestamps, axes, color, label):
     en, ln = xr.concat(en, dim = 'dataset'), xr.concat(ln, dim = 'dataset')
     
     # Panel 1: Baseline Z20 (BASELINE)
-    plot_with_spread(ax=axes[0], da=baseline, color=color, label=label, coord_dim="lon", horizontal=True)
+    plot_with_spread(ax=axes[0], da=baseline, color=color, label=label, coord_dim="lon", horizontal=True, linestyle=linestyle)
     # Panel 2: El Niño Z20 anomaly (EN - BASELINE)
-    plot_with_spread(ax=axes[1], da=en - baseline, color=color, label=label, coord_dim="lon", horizontal=True)
+    plot_with_spread(ax=axes[1], da=en - baseline, color=color, label=label, coord_dim="lon", horizontal=True, linestyle=linestyle)
     # Panel 3: La Niña Z20 anomaly (LN - BASELINE)
-    plot_with_spread(ax=axes[2], da=ln - baseline, color=color, label=label, coord_dim="lon", horizontal=True)
+    plot_with_spread(ax=axes[2], da=ln - baseline, color=color, label=label, coord_dim="lon", horizontal=True, linestyle=linestyle)
 
 # =============================================================================
 # =============================================================================

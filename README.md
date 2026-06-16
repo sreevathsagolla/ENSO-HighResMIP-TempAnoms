@@ -22,8 +22,7 @@ data/
     z20_depths/         # Depth of 20°C isotherm (Z20) timeseries
     griddes_025.grd     # CDO grid description for 0.25° grid
     pac_mask_025.npz    # Land–sea mask on 0.25° grid
-    Centred_BS_bounds_CMIP6_HIGHRESMIP_1950-2050.csv
-    Centred_BS_bounds_NPD_eORCA025_OBS_1976-2023.csv
+    Centred_BS_bounds.pkl # Climatological baseline information
 figures/                # Figures generated from plotting.ipynb
 data_prep.ipynb
 plotting.ipynb
@@ -32,7 +31,7 @@ utils.py
 environment.yml
 ```
 
-Large NetCDF and pickle files in `./data` are not included in the repository. Contact the author if needed.
+Large NetCDF and pickle files in `./data` are not included in the repository (check .gitignore). Contact the author if needed.
 
 ## Data Sources
 
@@ -47,7 +46,7 @@ Large NetCDF and pickle files in `./data` are not included in the repository. Co
 
 Run the following in order (requires data access):
 
-1. `data_prep.ipynb` – prepares anomalies and conservative temperature fields.
+1. `data_prep.ipynb` – prepares anomalies, conservative temperature fields and other necessary fields.
 2. `enso_preprocessing.py` – ENSO-focused preprocessing and event diagnostics.
 3. `plotting.ipynb` – generates all figures.
 
@@ -57,7 +56,7 @@ Run the following in order (requires data access):
 
 ### Acknowledgements
 
-Portions of the repository (code formatting/tidying up and documentation cleanup) were assisted using generative AI tools (i.e., ChatGPT 5.1 and Claude Sonnet 4.5). All scientific content, analysis logic, and results were developed by the primary author. Please feel free to contact the author if you require any further clarification.
+Portions of the repository (code formatting/tidying up and documentation cleanup) were assisted using generative AI tools (i.e., ChatGPT 5.5 and Claude Opus 4.8). All scientific content, analysis logic, and results were developed by the primary author. Please feel free to contact the author if you require any further clarification.
 
 ## License
 
