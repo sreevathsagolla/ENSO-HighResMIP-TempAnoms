@@ -2,33 +2,33 @@
 Code for storing utility functions for data pre-processing and plotting for analysis
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 16 June 2026
+Last updated: 25 November 2026
 """
 
-import os
-import sys
-import glob
+# Standard library
 import itertools
-import xarray as xr
-import pandas as pd
-import numpy as np
-from scipy import stats
-
-from PIL import Image
-import matplotlib.pyplot as plt
-from matplotlib.transforms import Bbox
-import cartopy.crs as ccrs
-
-from cdo import *
-cdo = Cdo()
-
-from scipy.stats import gaussian_kde
-from scipy.signal import welch, detrend
 from typing import Dict, List, Tuple
+import warnings
 
-# Dask cluster
+# Third-party
+import cartopy.crs as ccrs
+from cdo import Cdo
 import dask
 from dask.distributed import Client, LocalCluster
+import matplotlib.pyplot as plt
+from matplotlib.transforms import Bbox
+import numpy as np
+import pandas as pd
+from PIL import Image
+from scipy import stats
+from scipy.signal import detrend, welch
+from scipy.stats import gaussian_kde
+import xarray as xr
+
+# Runtime configuration and clients
+cdo = Cdo()
+dask.config.set({"distributed.admin.large-graph-warning-threshold": "1GiB"})
+warnings.filterwarnings("ignore", message=r"Sending large graph of size", category=UserWarning, module=r"distributed\.client")
 
 # =============================================================================
 # GENERIC HELPER FUNCTIONS THAT ARE BROADLY USED ACROSS THE REPOSITORY
@@ -38,7 +38,19 @@ def setup_dask_cluster(n_workers=6, threads_per_worker=3, memory_limit="48GB"):
     """
     Dask cluster setup (on ANEMONE HPC @ NOCS, UK):
     ----------------------------------------------
-    Initialize and return a Dask cluster and client.
+    Initialise and return a local Dask cluster and client. Temporary and local worker files are written
+    to /dssgfs01/scratch/sg13n23/temp/.
+
+    Parameters
+    ----------
+    n_workers (int)          : Number of workers. Default is 6.
+    threads_per_worker (int) : Threads per worker. Default is 3.
+    memory_limit (str)       : Memory limit of each worker. Default is "48GB".
+
+    Returns
+    -------
+    cluster (dask.distributed.LocalCluster) : Local cluster (dashboard on port 8787).
+    client (dask.distributed.Client)        : Client connected to the cluster.
     """
     dask.config.set({"temporary_directory": "/dssgfs01/scratch/sg13n23/temp/",
                      "local_directory": "/dssgfs01/scratch/sg13n23/temp/"})
@@ -110,22 +122,25 @@ def cdo_remapbil(filename_list, var_name, plev=850.):
     Parameters
     ----------
     filename_list (list of str) : List of input NetCDF file paths to process.
-    var_name (str)              : Variable name to extract (e.g., 'ua', 'va', 'tos').
-    plev (int)                  : Pressure level in hPa (only used when var_name == 'ua').
-                                  Converted internally to Pa for CDO ('sellevel').
+    var_name (str)              : Variable name to extract (e.g., 'thetao', 'so', 'thetao_con' or 'ua').
+    plev (float)                : Pressure level in hPa (only used when var_name == 'ua').
+                                  Converted internally to Pa for CDO ('sellevel'). Default is 850.
 
     Returns
     -------
     xr.Dataset : Dataset containing the selected variable remapped to a 0.25° grid,
                  concatenated along the 'time' dimension.
     """
+    # Imported here so that 'from utils import *' does not replace the tqdm of the calling notebook or script
+    from tqdm.auto import tqdm
+
     ds = []
     for f in tqdm(filename_list):
         if var_name == 'ua':  # For 850 hPa zonal wind: select level (CDO expects Pa)
             ds += [cdo.remapbil('./data/griddes_025.grd',
                                 input=f'-selvar,{var_name} -sellevel,{plev*100} '+f,
                                 returnXDataset=True)[['ua']]]
-        else:  # Other vars: select var and remap, then standardize coords
+        else:  # Other vars: select var and remap, then standardise coords
             ds += [renamer(cdo.remapbil('./data/griddes_025.grd',
                                         input=f'-selvar,{var_name} '+f,
                                         returnXDataset=True))]
@@ -135,7 +150,7 @@ def z20_calculator(ds):
     """
     Calculate the depth of the 20°C isotherm (Z20) by identifying, for each
     (time, lat, lon), the depth level whose conservative temperature is closest
-    to 20°C.
+    to 20°C. data_prep.ipynb crops the data to 5˚S-5˚N and 140˚E-280˚E before calling this function.
 
     Parameters
     ----------
@@ -298,14 +313,16 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
 
     1. Normalise longitudes to a 0 to 360 grid and subset to a tropical
        domain (default 20S to 20N, 120E to 80W).
-    2. Apply sqrt(cos(lat)) area weighting and compute the first two EOFs
-       (via SVD) of the anomaly field.
-    3. Decide which EOF is E-like and which is C-like based on their
-       relative loading over canonical Niño 3 and Niño 4 regions.
+    2. Apply sqrt(cos(lat)) area weighting, linearly detrend, and compute the
+       EOFs (via SVD) of the anomaly field.
+    3. Take EOF1 as the E-like and EOF2 as the C-like pattern (the automatic
+       assignment from the Niño 3 and Niño 4 loadings is disabled, see the
+       COMMENT NOTE in the code).
     4. Flip signs so that positive E warms Niño 3 and positive C warms
        Niño 4.
-    5. Form standardised E_index and C_index time series and compute
-       Niño 3, Niño 4 and Niño 3.4 indices from ssta.
+    5. Standardise both principal components and rotate them by 45 degrees
+       (Takahashi et al. 2011) to form the E_index and C_index time series.
+       Compute the Niño 3, Niño 4 and Niño 3.4 indices from ssta.
     6. For each event window, pick the peak month (max Niño 3.4 for El
        Niño, min for La Niña) and compare |E| and |C| at that time:
 
@@ -329,8 +346,8 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
                                 }
 
     dataset_name (str)      : Key into enso_events_dict that selects the events to classify for this call.
-    lat_bounds (float)      : Latitude bounds for the EOF domain. Default is 20S to 20N.
-    lon_bounds_eastdeg (float): Longitude bounds in degrees east on a 0 to 360 grid. Default is
+    lat_bounds (tuple)      : Latitude bounds for the EOF domain. Default is 20S to 20N.
+    lon_bounds_eastdeg (tuple) : Longitude bounds in degrees east on a 0 to 360 grid. Default is
                                 120˚E to 80˚W, expressed as (120, 280).
     gamma (float)           : Dominance margin in standard deviation units used to separate
                               EP and CP from Mixed events.
@@ -346,8 +363,12 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
                               - 'events_lanina' : list of per event dicts for La Niña
                               - 'indices'       : xr.Dataset containing E_index, C_index, Niño 3,
                                                   Niño 4, Niño 3.4 and the first two principal components
-                              - 'eof_patterns'  : xr.Dataset with EOF_E and EOF_C spatial
-                                                  patterns over the EOF domain
+                              - 'eof_patterns'  : xr.Dataset with the raw EOF1 and EOF2 patterns (EOF1_raw,
+                                                  EOF2_raw) and the rotated E and C patterns (EOF_E, EOF_C)
+                                                  over the EOF domain
+                              - 'flags'         : dict of booleans: 'EOF_FLIP' (always False, as the EOFs are
+                                                  no longer swapped) and 'E_PATTERN_SIGN_FLIP' /
+                                                  'C_PATTERN_SIGN_FLIP' (whether the sign of the pattern was flipped)
     """
     # Basic checks and converting longitude to 0 to 360 if needed
     if not set(['time', 'lat', 'lon']).issubset(set(ssta.dims) | set(ssta.coords)):
@@ -400,7 +421,7 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
     pc1 = xr.DataArray(PCs[:, 0], coords={'time': sub.time}, dims=('time',)).rename('PC1')
     pc2 = xr.DataArray(PCs[:, 1], coords={'time': sub.time}, dims=('time',)).rename('PC2')
 
-    # 3. Determining which EOF is E (EP) vs C (CP) using Niño 3 vs Niño 4 loadings
+    # 3. Assigning EOF1 to E (EP-like) and EOF2 to C (CP-like). The automatic assignment from the Niño 3 vs Niño 4 loadings is disabled (see below)
     def box_mean(da2, lat_bnds, lon_bnds):
         (lat_lo2, lat_hi2), (lo, hi) = lat_bnds, lon_bnds
         tmp = da2.sel(lat=slice(lat_lo2, lat_hi2))
@@ -434,13 +455,13 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
     
     # COMMENT NOTE: Flipping EOFs was causing incorrect reassignment for some simulations 
     # where EOF1 and EOF2 were not being cleanly separated in spatial variability signature 
-    # (leading to noisy/incorrect Nino3-minus-Nino4 differential). After visually checking 
+    # (leading to noisy/incorrect Niño 3 minus Niño 4 differential). After visually checking 
     # raw EOFs, it happened to be the case that EOF1 was always corresponding to E-like pattern.
 
     E_pattern, C_pattern = eof1.copy(), eof2.copy()
     E_pc, C_pc = pc1.copy(), pc2.copy()
     
-    # Fixing signs so that positive E warms Niño 3 and positive C warms Niño 4
+    # 4. Fixing signs so that positive E warms Niño 3 and positive C warms Niño 4
     if float(box_mean(E_pattern, *N3_box).values) < 0:
         E_pattern = -E_pattern
         E_pc = -E_pc
@@ -450,7 +471,7 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
         C_pc = -C_pc
         flags['C_PATTERN_SIGN_FLIP'] = True
         
-    # Standardise PCs BEFORE rotation (ensures equal variance)
+    # 5. Standardise PCs BEFORE rotation (ensures equal variance)
     E_pc_std = (E_pc - E_pc.mean()) / E_pc.std()
     C_pc_std = (C_pc - C_pc.mean()) / C_pc.std()
 
@@ -479,7 +500,7 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
                                'EOF_E': E_pattern.rename('EOF_E'),
                                'EOF_C': C_pattern.rename('EOF_C'),})
 
-    # 5. Helper to classify one list of events given a peak selector
+    # 6. Helper to classify one list of events given a peak selector
     def classify_events(event_windows: List[List[pd.Timestamp]], peak_selector: str) -> Tuple[Dict[str, int], List[Dict]]:
         EP = CP = MIX = 0
         details: List[Dict] = []
@@ -526,6 +547,7 @@ def classify_cp_ep_from_ssta(ssta, enso_events_dict, dataset_name, lat_bounds = 
             'events_lanina': events_ln, 'indices': indices, 'eof_patterns': eof_patterns, 'flags': flags}
 
 
+# LEGACY FUNCTION: No longer used in any script or notebook of this repository (kept for reference)
 def calculate_cdam(ds, threshold, method="sign"):
     """
     Calculate Cross-Dataset Agreement Mask (CDAM) and group mean composites
@@ -645,7 +667,7 @@ def calculate_cdam(ds, threshold, method="sign"):
 def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
                           lat_bounds=(-5, 5), lon_bounds=(140, 270),):
     """
-    Compute Gaussian KDE of ENSO peak locations for a given dataset.
+    Compute Gaussian KDE of El Niño/La Niña peak locations for a given dataset.
 
     For each ENSO month this function finds the location of the maximum
     absolute surface anomaly within a specified equatorial Pacific
@@ -657,7 +679,7 @@ def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
     ----------
     ds (xr.Dataset)          : Dataset containing variable 'anomaly' with dims
                                (time, depth, lat, lon).
-    event_timestamps (list)  : Flattened list of El Niño and La Niña months 
+    event_timestamps (list)  : Flattened list of El Niño or La Niña months 
                                for this dataset.
     kde_lats  (1D array like): Target latitude coordinates for 
                                the KDE evaluation grid.
@@ -672,7 +694,7 @@ def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
                                values on the target grid. If no valid peaks are found the
                                array is filled with zeros.
     """
-    # Subsetting ENSO months and region, take absolute anomaly at surface
+    # Subsetting El Niño/La Niña months and region, take absolute anomaly at surface
     ds_pac_enso = np.abs(ds.sel(time=event_timestamps, depth=0, method="nearest")
                          .sel(lat=slice(*lat_bounds), lon=slice(*lon_bounds))["anomaly"])
 
@@ -699,12 +721,12 @@ def compute_enso_peak_kde(ds, event_timestamps, kde_lats, kde_lons,
     return kde_vals.reshape(lat_grid.shape)
 
 # =============================================================================
-# HELPER FUNCTIONS USED IN plotting.ipynb NOTEBOOK
+# HELPER FUNCTIONS USED IN plotting.ipynb AND THE APPENDIX NOTEBOOKS
 # =============================================================================
 
 def format_axis(ax = None, kind = None, **kwargs):
     """
-    Generic axis formatting helper for plotting.ipynb notebook
+    Generic axis formatting helper for the plotting.ipynb and appendix notebooks
 
     Parameters
     ----------
@@ -715,14 +737,17 @@ def format_axis(ax = None, kind = None, **kwargs):
                                 - 'map'         : Cartopy map panels
                                 - 'kde'         : ENSO peak KDE panels
                                 - 'event_comp'  : Event-centred Hovmöller panels
-                                - 'vert_prof'   : Vertical profile panels (latitudinal extent / anomaly)
-                                - 'z20'         : Z20 depth panels (climatology and bias)
+                                - 'vert_prof'   : Vertical profile panels (i < 2: latitudinal extent, else anomaly)
+                                - 'z20'         : Z20 depth panels (i = 0: climatology, else bias)
     kwargs                    : Extra options needed for some kinds:
-                                - period      (str)  for 'oni' (e.g. 'HIST_EVAL_1979-2014', 'FUTR_EVAL_2015-2050')
-                                - panel_id    (str)  for 'psd' (panel label)
-                                - i           (int)  for 'event_comp', 'vert_prof', 'z20'
-                                - last_row    (bool) for 'event_comp'
-                                - land_50m, coast_50m  for 'map' (cartopy features)
+                                - period            (str)   for 'oni' (e.g. 'HIST_EVAL_1979-2014', 'FUTR_EVAL_2015-2050')
+                                - twin              (bool)  for 'oni': True for an overlaid .twiny() axis
+                                - model_year_offset (int)   for 'oni': label the x ticks as model years (e.g. 30 for CTRL)
+                                - ylim              (tuple) for 'oni': y-axis limits. Default is (-3.5, 3.5)
+                                - panel_id          (str)   for 'psd' (panel label)
+                                - land_ft, coast_ft         for 'map' (cartopy features)
+                                - i                 (int)   for 'event_comp', 'vert_prof', 'z20' (panel index)
+                                - last_row          (bool)  for 'event_comp'
     """
     # Normalise kind string
     kind = str(kind).lower()
@@ -825,7 +850,7 @@ def format_axis(ax = None, kind = None, **kwargs):
 
         # y-labels only on left column (even indices 0,2,4 etc.)
         ax.set_ylabel('Depth (m)' if i % 2 == 0 else '', fontsize=12)
-        # x-labels only on bottom row (indices 4,5)
+        # x-label only on the bottom row (last_row=True)
         ax.set_xlabel('Time (in months) relative to phase peak' if last_row == True else '', fontsize=12,)
 
     elif kind == "vert_prof":
@@ -841,9 +866,9 @@ def format_axis(ax = None, kind = None, **kwargs):
 
         if i < 2:
             # Left two panels: latitudinal extent (auto-scaled x-axis, no % formatting)
-            ax.set_xlabel('Latitudinal extent within 10°S-10°N', fontsize=18)
+            ax.set_xlabel('Latitudinal extent within 5°S-5°N', fontsize=18)
         else:
-            # Right panel: anomaly profile with a simpler locator
+            # Right two panels: anomaly profile with a simpler locator
             ax.xaxis.set_major_locator(plt.MaxNLocator(5))
             ax.set_xlabel('Anomaly (˚C)', fontsize=18)
 
@@ -876,33 +901,33 @@ def add_colorbar(fig, axes, mappable, label, ticks, side="right",
                  width=0.010, height=0.018, pad=0.007, ticksize=10, 
                  labelsize=12, height_scale=0.90,):
     """
-    Add a colorbar aligned with a block of axes.
+    Add a colourbar aligned with a block of axes.
 
     Parameters
     ----------
     fig (matplotlib.figure.Figure) : Figure object.
-    axes (sequence of Axes)        : Axes that define the block to align the colorbar with.
+    axes (sequence of Axes)        : Axes that define the block to align the colourbar with.
     mappable (ScalarMappable)      : Object returned by contourf/pcolormesh/etc.
-    label (str)                    : Colorbar label.
-    ticks (sequence)               : Tick locations for the colorbar.
-    side ({"right", "bottom"})     : Where to place the colorbar relative to the axes block.
+    label (str)                    : Colourbar label.
+    ticks (sequence)               : Tick locations for the colourbar.
+    side ({"right", "bottom"})     : Where to place the colourbar relative to the axes block.
                                      - "right": vertical bar to the right (uses `width`, `height_scale`).
                                      - "bottom": horizontal bar below (uses `height`).
     width (float)                  : Thickness of the bar when side="right" (in figure fraction).
     height (float)                 : Thickness of the bar when side="bottom" (in figure fraction).
-    pad (float)                    : Padding between the axes block and the colorbar (figure fraction)
+    pad (float)                    : Padding between the axes block and the colourbar (figure fraction)
     ticksize (int)                 : Font size for ticks.
     labelsize (int)                : Font size for label.
     height_scale (float)           : Only used for side="right": fraction of axes block height to use.
 
     Returns
     -------
-    cb (matplotlib.colorbar.Colorbar) : Colorbar object
+    cb (matplotlib.colorbar.Colorbar) : Colourbar object
     """
     # Compute bounding box enclosing all axes
     row_box = Bbox.union([ax.get_position(fig).frozen() for ax in axes])
 
-    # Decide placement and create colorbar axis
+    # Decide placement and create colourbar axis
     if side == "right":
         # Vertical bar placed to the right of the axes block
         cax = fig.add_axes([row_box.x1 + pad, row_box.y0, width, row_box.height * height_scale,])
@@ -913,7 +938,7 @@ def add_colorbar(fig, axes, mappable, label, ticks, side="right",
         orientation = "horizontal"
     else:
         raise ValueError(f"Unsupported side: {side!r}")
-    # Create and format the colorbar
+    # Create and format the colourbar
     cb = fig.colorbar(mappable, cax=cax, orientation=orientation, ticks=ticks)
     cb.set_label(label, fontsize=labelsize)
     cb.ax.tick_params(labelsize=ticksize)
@@ -934,18 +959,19 @@ def plot_with_spread(ax, da, color, label, coord_dim, horizontal=True, linestyle
     ----------
     ax (matplotlib.axes.Axes) : Axis to plot on.
     da (xr.DataArray)         : DataArray with dims including 'dataset' and coord_dim.
-    color (any)               : Line/patch color.
+    color (any)               : Line/patch colour.
     label (str)               : Legend label.
     coord_dim (str)           : Dimension to plot along the x-axis (if horizontal=True) 
                                 or y-axis (if horizontal=False).
     horizontal (bool)         : If True, plot coord_dim on x-axis. 
                                 If False, plot coord_dim on y-axis.
+    linestyle (str)           : Line style of the group mean. Default is '-'.
     """
     # Mean and std across datasets
     mean_vals = da.mean(dim="dataset")
     std_vals = da.std(dim="dataset")
 
-    # Droping NaNs in the plotted coordinate to avoid gaps
+    # Dropping NaNs in the plotted coordinate to avoid gaps
     mean_vals = mean_vals.dropna(dim=coord_dim)
     std_vals = std_vals.sel({coord_dim: mean_vals[coord_dim]})
 
@@ -966,10 +992,13 @@ def plot_with_spread(ax, da, color, label, coord_dim, horizontal=True, linestyle
 def merge_pngs_vertical(paths, out_path):
     """
     Merge multiple PNG files vertically into one PNG.
+
+    Images narrower than the widest one are rescaled (LANCZOS) to the same width. The merged image is RGB
+    with a white background.
     
     Parameters
     ----------
-    paths (list)     : List of figure paths to merge.
+    paths (list)     : List of figure paths to merge, from top to bottom.
     out_path (str)   : Output path for the merged figure.
     """
     # Loading all images
@@ -998,7 +1027,7 @@ def merge_pngs_vertical(paths, out_path):
 
     combined.save(out_path)
     
-def plot_psd_series(series_name, n34_data, ax, peak_points, psd_kwargs, line_kw, peak_marker_kw):
+def plot_psd_series(series_name, n34_data, ax, peak_points, psd_kwargs, line_kw, peak_marker_kw, ns_lst):
     """
     Plot PSD for a single series and record its peak location.
 
@@ -1007,10 +1036,14 @@ def plot_psd_series(series_name, n34_data, ax, peak_points, psd_kwargs, line_kw,
     series_name (str)         : Column name in n34_data.
     n34_data (pd.DataFrame)   : DataFrame with Niño 3.4 indices (columns = datasets).
     ax (matplotlib.axes.Axes) : Axis to plot on.
-    peak_points (list)        : List that will be appended with (peak_T, peak_P, peak_marker_kw).
-    psd_kwargs (dict)         : Keyword args passed to compute_psd (nperseg, period_min, period_max, fs).
+    peak_points (list)        : List that will be appended with (peak_T, peak_P, peak_marker_kw, significant),
+                                where significant is False if series_name is in ns_lst.
+    psd_kwargs (dict)         : Keyword args passed to compute_psd (nperseg, period_min, period_max, fs,
+                                noverlap_frac, nfft).
     line_kw (dict)            : Keyword args for the PSD line (color, ls, lw, etc.).
     peak_marker_kw (dict)     : Marker styling stored for later plotting of peak points.
+    ns_lst (list of str)      : Names of the series whose dominant peak is not significant against red noise
+                                (p > 0.05), see appendix_A.ipynb.
     """
     # Computing PSD for this series
     period, P, peak_T, peak_P = compute_psd(n34_data[series_name].dropna(), **psd_kwargs)
@@ -1022,7 +1055,7 @@ def plot_psd_series(series_name, n34_data, ax, peak_points, psd_kwargs, line_kw,
     
     # Storing peak location for later marker plotting
     if peak_T is not None:
-        peak_points.append((peak_T, peak_P, peak_marker_kw))
+        peak_points.append((peak_T, peak_P, peak_marker_kw, series_name not in ns_lst))
 
         
 def peak_lonlat(da2d):
@@ -1039,6 +1072,7 @@ def peak_lonlat(da2d):
     lon_pk = float(da2d['lon'].values[k % nlon])
     return lon_pk, lat_pk
 
+# LEGACY FUNCTION: No longer used in any script or notebook of this repository (kept for reference)
 def jitter(x, y, k, r=0.35):
     """
     Function to give tiny visual jitter to the KDE points, so they don't overlap.
@@ -1047,24 +1081,30 @@ def jitter(x, y, k, r=0.35):
     ----------
     x (float) : Longitude value of peak of KDE distribution
     y (float) : Latitude value of peak of KDE distribution
-    k (float) : Index value (check plotting.ipynb, where this function is used)
-    r (float) : Scale factor
+    k (int)   : Index of the point. The offset direction cycles through 12 angles of 30 degrees, i.e. k % 12
+    r (float) : Scale factor (offset distance in the units of x and y)
     """
     ang = (k % 12) * (np.pi/6.0)
     return x + r*np.cos(ang), y + r*np.sin(ang)
 
+# LEGACY FUNCTION: No longer used in any script or notebook of this repository (kept for reference)
 def event_hov_calculator(dataset=None, event_type=None, enso_event_flav_dict = None, n34_hov = None):
     """
     Calculate El Niño or La Niña composite Hovmöller (depth vs. time; averaged over Niño 3.4)
-    for a given dataset by slicing -12 to + 8 months time slice about an ENSO events' peak timestamp.
+    for a given dataset by taking the -14 to +8 months window about each ENSO event's peak timestamp.
     
     Parameters
     ----------
-    dataset (str)             : Dataset name as a string.
-    event (str)               : ENSO event type (i.e., EL-NINO or LA-NINA).
-    enso_event_flav_dict (dict)    : Nested dictionary of ENSO event flavours, containing event peak timestamps
-    n34_hov (xr.DataArray)    : Niño 3.4 Hovmoller (depth vs. time) for the full-time period.
+    dataset (str)                : Dataset name as a string.
+    event_type (str)             : ENSO event type, 'elnino' or 'lanina' (as in the 'events_<event_type>' keys).
+    enso_event_flav_dict (dict)  : Nested dictionary of ENSO event flavours, containing event peak timestamps
+    n34_hov (xr.DataArray)       : Niño 3.4 Hovmöller (depth vs. time) for the full-time period.
 
+    Returns
+    -------
+    xr.Dataset : Variables EN_COMPOSITE and EN_COMPOSITE_SIG (El Niño) or LN_COMPOSITE and LN_COMPOSITE_SIG
+                 (La Niña) with dims (dataset, time, depth): the mean across events, and a boolean mask that is
+                 True where it differs from zero (one-sample t-test, p < 0.05).
     """
     event_peak_times = [_['peak_time'] for _ in enso_event_flav_dict[dataset][f'events_{event_type}']]
     
@@ -1097,11 +1137,20 @@ def event_hov_calculator(dataset=None, event_type=None, enso_event_flav_dict = N
         hov_all['LN_COMPOSITE_SIG'] = (('dataset', 'time', 'depth'), sig_mask)
     return hov_all
 
+# LEGACY FUNCTION: No longer used in any script or notebook of this repository (kept for reference)
 def gridcell_counter(da):
     """
-    Calculate the number of non-NaN gridcells between 10˚S-10˚N of an xarray.Dataset i.e., da
-    to determine latidutinal extent of coverage by the extreme temperature anomaliesv(ref. 
-    Figure 6 and 11, panel a).    
+    Calculate the latitudinal extent (in degrees, assuming a 20˚ latitude span) of the non-NaN gridcells of an
+    xarray.DataArray, as a measure of the latitudinal coverage by extreme temperature anomalies (ref. Figures 6
+    and 11, panel a). The extent is now computed within 5˚S-5˚N in appendices/appendix_A.ipynb.
+    
+    Parameters
+    ----------
+    da (xr.DataArray) : Masked anomalies with dims including 'lat' and 'lon'.
+
+    Returns
+    -------
+    xr.DataArray : 20 x the fraction of non-NaN latitudes, averaged across longitude.
     """
     # Count valid (non-NaN) cells along latitude
     number_of_gridcells = (~np.isnan(da)).sum(dim='lat')
@@ -1112,13 +1161,13 @@ def gridcell_counter(da):
     
 def z20_grp_calc(da_z20, enso_timestamps, axes, color, label, linestyle='-'):
     """
-    Calculate and plot the mean depth of 20˚C (Z20) isotherm for ENSO events and the
-    climatological baseline mean
+    Calculate and plot the group-mean depth of the 20˚C (Z20) isotherm for ENSO events and the
+    climatological baseline mean, with the spread (±1 std) across the datasets of the group
     
     Parameters
     ----------
-    da (xr.DataArray)           : Dataset containing Z20 timeseries data, averaged over 5˚S and 5˚N, 
-                                  and between 140˚E and 290˚E
+    da_z20 (xr.DataArray)       : Z20 depths with dims (dataset, time, lon), averaged over 5˚S-5˚N and
+                                  interpolated to a 0.1˚ grid between 140˚E and 280˚E (see data_prep.ipynb)
     enso_timestamps (dict)      : Nested dictionary of event windows keyed by dataset.
                                   name and by phase, for example:
                                   {
@@ -1128,9 +1177,11 @@ def z20_grp_calc(da_z20, enso_timestamps, axes, color, label, linestyle='-'):
                                         },
                                     ...
                                     }
-    axes (matplotlib.axes.Axes) : Axis to plot on.
-    color (any)                 : Line/patch color.
+    axes (sequence of Axes)     : Three axes: the baseline Z20, and the El Niño and La Niña Z20 anomalies
+                                  relative to the baseline.
+    color (any)                 : Line/patch colour.
     label (str)                 : Legend label.
+    linestyle (str)             : Line style of the group mean. Default is '-'.
     """
     # Climatological Z20 baseline for each dataset (mean over its full time span)
     baseline = da_z20.mean(dim = ['time'])
@@ -1150,6 +1201,3 @@ def z20_grp_calc(da_z20, enso_timestamps, axes, color, label, linestyle='-'):
     plot_with_spread(ax=axes[1], da=en - baseline, color=color, label=label, coord_dim="lon", horizontal=True, linestyle=linestyle)
     # Panel 3: La Niña Z20 anomaly (LN - BASELINE)
     plot_with_spread(ax=axes[2], da=ln - baseline, color=color, label=label, coord_dim="lon", horizontal=True, linestyle=linestyle)
-
-# =============================================================================
-# =============================================================================

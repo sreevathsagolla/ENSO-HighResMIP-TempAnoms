@@ -1,6 +1,9 @@
 # Specific large pickle files
 data/processed/ENSO_EVENT_FLAVOURS_FUTR_EVAL_2015-2050.pkl
 data/processed/ENSO_EVENT_FLAVOURS_HIST_EVAL_1979-2014.pkl
+data/processed/ENSO_EVENT_FLAVOURS_TRNC_SCEN_2015-2040.pkl
+data/processed/ENSO_SSTA_COMP_DIFF_RESULTS_WITH_SIG.nc
+data/processed/ENSO_N34_HOV_COMP_DIFF_RESULTS_WITH_SIG.nc
 
 # NetCDF groups
 data/z20_depths/*.nc
@@ -8,11 +11,15 @@ data/zon_wnds_850hpa/*.nc
 data/thetao_con/*/*.nc
 data/anomalies/*/*.nc
 data/processed/ENSO_TEMPANOM_COMPOSITES/*.nc
+data/processed/EXT_TEMP_BOOTSTRAP/*.nc
 
 # CTRL sensitivity checks (not relevant/presented in the manuscript)
 CTRL_MODEL_DRIFT/*
 
 # Misc.
 __pycache__/
+
+# Script backups
+.backups/
 
 # NOTE: All of these are large files to host on GitHub, but can be made available on request.

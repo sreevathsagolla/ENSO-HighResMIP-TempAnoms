@@ -4,25 +4,28 @@ from CMIP6 HighResMIP model simulations, NPD_eORCA025 atmosphere-forced ocean-on
 model runs, and observations-based datasets
 -------------------------------------------------------------------------------------------
 Author: Sreevathsa G. (sg13n23@soton.ac.uk; ORCID ID: 0000-0003-4084-9677)
-Last updated: 16 June 2026
+Last updated: 25 November 2026
 """
 
-# =============================================================================
-# IMPORTS
-# =============================================================================
-import pickle
-import numpy as np
-import xarray as xr
-import pandas as pd
-from tqdm import tqdm
+# Standard library
 from itertools import product
+import pickle
+import warnings
 
-from utils import renamer, flatten, compute_psd, sequence_finder, classify_cp_ep_from_ssta, compute_enso_peak_kde, setup_dask_cluster
-
-# Dask cluster
+# Third-party
 import dask
 from dask.distributed import Client, LocalCluster
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+import xarray as xr
 
+# Local modules
+from utils import *
+
+# Runtime configuration and Dask setup
+dask.config.set({"distributed.admin.large-graph-warning-threshold": "1GiB"})
+warnings.filterwarnings("ignore", message=r"Sending large graph of size", category=UserWarning, module=r"distributed\.client")
 
 # =============================================================================
 # CONSTANTS AND CONFIGURATION
@@ -86,9 +89,10 @@ def initialize_data_containers(dataset_list, time_index):
     oni_data = n34_data.copy(deep=True)
     
     # KDE container
-    gaussian_kde_netcdf = xr.Dataset(coords={"lon": KDE_LONS, "lat": KDE_LATS, "dataset": dataset_list})
-    gaussian_kde_netcdf["GAUSS_KDE"] = xr.DataArray(np.full((len(dataset_list), len(KDE_LATS), len(KDE_LONS)), np.nan),
-                                                    dims=("dataset", "lat", "lon"))
+    gaussian_kde_netcdf = xr.Dataset(coords={"dataset": dataset_list, "enso_phase": ['EL-NINO', 'LA-NINA'], 
+                                            "lon": KDE_LONS, "lat": KDE_LATS})
+    gaussian_kde_netcdf["GAUSS_KDE"] = xr.DataArray(np.full((len(dataset_list), 2, len(KDE_LATS), len(KDE_LONS)), np.nan),
+                                                    dims=("dataset", "enso_phase", "lat", "lon"))
     
     # ONI stats container
     df_oni_stats = pd.DataFrame(columns=ONI_STATS_COLS)
@@ -178,25 +182,22 @@ def calculate_oni_statistics(n34_series, oni_series, el_ts, ln_ts):
 
 def build_event_timestamps(enso_event_flavour):
     """
-    Build a flat list of ENSO events, with each list item formatted as:
-    (phase_type, flavour_type, event_timestamps)
+    Build a flat list of ENSO events, El Niño first then La Niña (this order defines event_id), each item:
+    (phase_type, flavour_type, event_timestamps, start, end, peak)
     """
     event_ts = []
-    # Process El Niño events
-    for event in enso_event_flavour['events_elnino']:
-        event_ts.append(('EL-NINO', event['label'], list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))))
-
-    # Process La Niña events
-    for event in enso_event_flavour['events_lanina']:
-        event_ts.append(('LA-NINA', event['label'], list(pd.date_range(start=event['start'], end=event['end'], freq='1MS'))))
+    for phase, key in (('EL-NINO', 'events_elnino'), ('LA-NINA', 'events_lanina')):
+        for event in enso_event_flavour[key]:
+            event_ts.append((phase, event['label'],
+                             list(pd.date_range(start=event['start'], end=event['end'], freq='1MS')),
+                             pd.Timestamp(event['start']), pd.Timestamp(event['end']), pd.Timestamp(event['peak_time'])))
     return event_ts
 
 
-def compute_enso_composites(ds_pac, event_ts, enso_events, dataset):
-    """Compute event-level ENSO SSTA composites, and merges into a single dataset."""
+def compute_enso_composites(ds_pac, event_ts, dataset):
+    """Compute event-level ENSO composites and merge into a single dataset with per-event metadata coordinates."""
     composite_ds = []
-    
-    for event_id, (event_type, reg_type, event_timesteps) in enumerate(event_ts):
+    for event_id, (event_type, reg_type, event_timesteps, start, end, peak) in enumerate(event_ts):
         da = (ds_pac.sel(time=event_timesteps)
                     .mean(dim="time")                              # keeps (depth, lat, lon) or (lat, lon) depending on ds_pac
                     .rename({"anomaly": "event_level_composite"})
@@ -205,6 +206,9 @@ def compute_enso_composites(ds_pac, event_ts, enso_events, dataset):
         da = da.assign_coords(
             event_reg_type=("event_id", [reg_type]),
             event_type=("event_id", [event_type]),
+            event_start=("event_id", np.array([start], dtype="datetime64[ns]")),   # first month of the event
+            event_end=("event_id", np.array([end], dtype="datetime64[ns]")),       # last month of the event
+            event_peak=("event_id", np.array([peak], dtype="datetime64[ns]")),     # month of peak |ONI|
         )
         composite_ds.append(da)
     return xr.merge(composite_ds).compute()
@@ -238,10 +242,12 @@ def process_single_dataset(dataset, year_start, year_end, time_index,
     n34_hov_ds_list.append(anom_aw_mean.interp(depth=HOV_DEPTH).bfill(dim="depth").expand_dims(dataset=[dataset]))
     
     # Gaussian KDE for peak anomaly locations
-    all_event_timestamps = (flatten(enso_events[dataset]["EL-NINO"]) + flatten(enso_events[dataset]["LA-NINA"]))
-    kde_result = compute_enso_peak_kde(ds=ds_pac, event_timestamps=all_event_timestamps,
-                                       kde_lats=gaussian_kde_netcdf["lat"].values, kde_lons=gaussian_kde_netcdf["lon"].values)
-    gaussian_kde_netcdf["GAUSS_KDE"].loc[dict(dataset=dataset)] = kde_result
+    for enso_phase in ['EL-NINO', 'LA-NINA']:
+        time_stamps = flatten(enso_events[dataset][enso_phase])
+        kde_result = compute_enso_peak_kde(ds=ds_pac, event_timestamps=time_stamps,
+                                        kde_lats=gaussian_kde_netcdf["lat"].values, 
+                                        kde_lons=gaussian_kde_netcdf["lon"].values)
+        gaussian_kde_netcdf["GAUSS_KDE"].loc[dict(dataset=dataset, enso_phase=enso_phase)] = kde_result
     
     # Determine ENSO 'flavour' (following Takahashi et al., 2011)
     enso_event_flavour_eof_method[dataset] = classify_cp_ep_from_ssta(ssta=ds_pac["anomaly"].sel(depth=0, method="nearest"),
@@ -256,7 +262,7 @@ def process_single_dataset(dataset, year_start, year_end, time_index,
     event_ts = build_event_timestamps(enso_event_flavour_eof_method[dataset])
     
     # Compute and save composites
-    composite_ds = compute_enso_composites(ds_pac, event_ts, enso_events[dataset], dataset)
+    composite_ds = compute_enso_composites(ds_pac, event_ts, dataset)
     composite_ds.to_netcdf(f'./data/processed/ENSO_TEMPANOM_COMPOSITES/ENSO_TEMPANOM_COMPOSITES_{dataset}_{period_label}.nc')
 
 
@@ -355,6 +361,9 @@ if __name__ == "__main__":
     
     # Process future evaluation period (2015-2050): SCEN only
     run_period(dataset_list=DATASET_LIST_FUTR_EVAL, start_date="2015-01-01", end_date="2050-12-31", period_label="FUTR_EVAL_2015-2050")
+
+    # Process truncated scenario period (2015-2040): SCEN only
+    run_period(dataset_list=DATASET_LIST_FUTR_EVAL, start_date="2015-01-01", end_date="2040-12-31", period_label="TRNC_SCEN_2015-2040")
     
     # Cleanup
     client.shutdown()
